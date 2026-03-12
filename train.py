@@ -16,11 +16,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
+# FA4 for Hopper / datacenter Blackwell, SDPA fallback for sm_120+
 cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+arch = cap[0] * 10 + cap[1]
+if arch // 10 in [9, 10, 11]:  # FA4: Hopper (sm_90), datacenter Blackwell (sm_100/110)
+    from flash_attn.cute import flash_attn_func as _fa_func
+else:
+    # SDPA fallback (sm_120 workstation Blackwell, or older GPUs)
+    # Note: ignores window_size — all layers use full causal attention
+    def _fa_func(q, k, v, causal=True, window_size=(-1, -1)):
+        # FA uses (B, T, H, D), SDPA uses (B, H, T, D)
+        y = F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            is_causal=causal,
+        )
+        return y.transpose(1, 2)
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -89,7 +99,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        y = _fa_func(q, k, v, causal=True, window_size=window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
